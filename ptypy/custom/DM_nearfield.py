@@ -1,0 +1,303 @@
+# -*- coding: utf-8 -*-
+"""
+An extension plugin of the Difference Map engine, tailored to the slow
+low-frequency convergence of *near-field* ptychography.
+
+Motivation
+----------
+In near-field ptychography the propagation is a Fresnel chirp whose contrast
+transfer function (CTF) for a weak/pure-phase object behaves like
+
+    CTF(f) ~ sin( pi * lam * z * f**2 )
+
+which vanishes at low spatial frequencies (f -> 0). The measured intensity is
+therefore almost blind to the low-frequency phase content of the object. Two
+practical consequences follow:
+
+1. Low frequencies relax extremely slowly under Difference Map, producing the
+   familiar *halo* artefact around the sample that only disappears after many
+   thousands of iterations.
+2. The usual error metrics live in the detector plane, where those same low
+   frequencies carry near-zero weight (CTF ~ 0). The metric is effectively
+   CTF-weighted and so is blind to exactly the modes that converge slowest --
+   it cannot "see" the halo decaying.
+
+This engine adds two opt-in tools:
+
+* **An object-plane low-frequency convergence metric** (Part 1) so the halo's
+  evolution can actually be monitored. It is recorded in
+  ``ptycho.runtime.iter_info[-1]['nf_metric']`` and logged each iteration.
+
+* **A Fourier-domain preconditioner of the object update** (Part 2) that boosts
+  the poorly-constrained low frequencies of the *object increment* (not the
+  object itself), accelerating the slow modes while leaving the DM fixed point
+  unchanged (at convergence the increment -> 0, so the boost does nothing).
+
+Both features are disabled by default; switching either on reproduces plain DM
+up to the enabled behaviour.
+
+authors: J. C. da Silva
+"""
+import numpy as np
+
+from ptypy.engines import projectional
+from ptypy.engines import register
+from ptypy.utils.verbose import log
+
+
+@register()
+class DMNearfield(projectional.DM):
+    """
+    Difference Map with near-field low-frequency acceleration and diagnostics.
+
+    Defaults:
+
+    [nf_metric]
+    default = True
+    type = bool
+    help = Track an object-plane low-frequency convergence metric
+    doc = When enabled, the relative iteration-to-iteration change of the\
+          low-pass-filtered object is recorded under the 'nf_metric' key of the\
+          runtime iteration info and logged. This is sensitive to the halo that\
+          the detector-plane error is blind to.
+
+    [nf_metric_cutoff]
+    default = 0.1
+    type = float
+    lowlim = 0.0
+    uplim = 1.0
+    help = Low-pass cutoff for the metric, as a fraction of the Nyquist frequency
+    doc = The metric measures the change of the object band below this cutoff.\
+          0.1 keeps the lowest 10 percent of frequencies, i.e. the band most\
+          affected by the near-field CTF zero.
+
+    [nf_precond]
+    default = False
+    type = bool
+    help = Enable the Fourier-domain preconditioner of the object update
+    doc = Amplifies the low-frequency content of the object *increment* to\
+          accelerate the slowly-converging modes. The DM fixed point is\
+          preserved because the boost acts on the per-iteration increment only.
+
+    [nf_precond_start]
+    default = 0
+    type = int
+    lowlim = 0
+    help = Number of iterations before preconditioning starts
+
+    [nf_precond_stop]
+    default = None
+    type = int
+    help = Number of iterations after which preconditioning stops (None = never)
+
+    [nf_precond_method]
+    default = gain
+    type = str
+    help = Preconditioner shape; 'gain' (robust Gaussian low-frequency boost) or 'ctf' (regularised inverse-CTF from the geometry)
+    choices = ['gain', 'ctf']
+
+    [nf_precond_gain]
+    default = 4.0
+    type = float
+    lowlim = 1.0
+    help = Maximum amplification applied to the low frequencies of the increment
+
+    [nf_precond_cutoff]
+    default = 0.1
+    type = float
+    lowlim = 0.0
+    uplim = 1.0
+    help = Cutoff of the 'gain' boost as a fraction of the Nyquist frequency
+
+    [nf_precond_reg]
+    default = 0.1
+    type = float
+    lowlim = 0.0
+    help = Regularisation (relative to max CTF^2) for the 'ctf' preconditioner
+    doc = Larger values are more conservative, capping the amplification near\
+          the CTF zeros to suppress noise.
+
+    """
+
+    def __init__(self, ptycho_parent, pars=None):
+        super().__init__(ptycho_parent, pars)
+        # Per-storage cache of the previous low-pass object (for the metric)
+        self._nf_prev_lowpass = {}
+        # Per-storage cache of the preconditioner filter, keyed by (name, shape)
+        self._nf_filter_cache = {}
+        # Latest metric value, surfaced through _fill_runtime
+        self._nf_metric_value = None
+
+    # ------------------------------------------------------------------ #
+    # Part 2: Fourier-domain preconditioner of the object update         #
+    # ------------------------------------------------------------------ #
+    def _nf_precond_active(self):
+        if not self.p.nf_precond:
+            return False
+        if self.curiter < self.p.nf_precond_start:
+            return False
+        if (self.p.nf_precond_stop is not None) and (self.curiter >= self.p.nf_precond_stop):
+            return False
+        return True
+
+    def _nf_geometry_for(self, storage):
+        """
+        Find a Geometry instance whose object view lives in `storage`.
+        Returns None if none can be located (e.g. not yet prepared).
+        """
+        for pod in self.pods.values():
+            if not pod.active:
+                continue
+            if pod.ob_view.storage is storage:
+                return pod.geometry
+        return None
+
+    def _nf_build_filter(self, name, storage):
+        """
+        Build (and cache) the Fourier-domain amplification filter for a given
+        object storage, evaluated on its last two axes. The filter is >= 1 and
+        amplifies the low-frequency band; it multiplies FFT(increment).
+        """
+        shape = storage.data.shape[-2:]
+        key = (name, shape, self.p.nf_precond_method)
+        cached = self._nf_filter_cache.get(key)
+        if cached is not None:
+            return cached
+
+        ny, nx = shape
+        if self.p.nf_precond_method == 'ctf':
+            geo = self._nf_geometry_for(storage)
+            if geo is None:
+                log(2, "DMNearfield: no geometry found for object storage %s; "
+                       "falling back to 'gain' preconditioner." % name)
+                filt = self._nf_gain_filter(ny, nx)
+            else:
+                filt = self._nf_ctf_filter(ny, nx, geo)
+        else:
+            filt = self._nf_gain_filter(ny, nx)
+
+        filt = filt.astype(np.float32)
+        self._nf_filter_cache[key] = filt
+        return filt
+
+    def _nf_gain_filter(self, ny, nx):
+        """
+        Smooth low-frequency boost: G(f) = 1 + (gain-1) * exp(-(|f|/fc)^2),
+        with f in normalised frequency (Nyquist = 0.5). Monotone, no CTF-zero
+        spikes -- the robust default.
+        """
+        fy = np.fft.fftfreq(ny)[:, None]
+        fx = np.fft.fftfreq(nx)[None, :]
+        f2 = fy ** 2 + fx ** 2
+        fc = self.p.nf_precond_cutoff * 0.5
+        gauss = np.exp(-f2 / (fc ** 2 + 1e-12))
+        return 1.0 + (self.p.nf_precond_gain - 1.0) * gauss
+
+    def _nf_ctf_filter(self, ny, nx, geo):
+        """
+        Regularised inverse-CTF boost built from the actual near-field geometry:
+
+            CTF(f) = sin(chi(f)),  chi(f) = 2*pi*(z/lam)*(sqrt(1 - (lam f)^2) - 1)
+            G(f)   = clip( (CTF_max^2 + a) / (CTF(f)^2 + a), 1, gain )
+
+        where a = reg * CTF_max^2. This selectively amplifies the bands where
+        the near-field response is weak (low frequencies and the CTF zeros),
+        capped by `nf_precond_gain` for stability.
+        """
+        lam = float(geo.lam)
+        z = float(geo.p.distance)
+        # resolution is the sample-plane pixel size (dy, dx) in metres
+        res = np.asarray(geo.resolution, dtype=np.float64).ravel()
+        dy, dx = (res[0], res[-1])
+
+        fy = np.fft.fftfreq(ny, d=dy)[:, None]
+        fx = np.fft.fftfreq(nx, d=dx)[None, :]
+        a2 = (lam * fy) ** 2 + (lam * fx) ** 2
+        # Evanescent / out-of-band frequencies: treat as fully blind (CTF=0)
+        a2 = np.clip(a2, 0.0, 1.0)
+        chi = 2.0 * np.pi * (z / lam) * (np.sqrt(1.0 - a2) - 1.0)
+        ctf2 = np.sin(chi) ** 2
+
+        ctf2_max = ctf2.max()
+        if ctf2_max <= 0:
+            return self._nf_gain_filter(ny, nx)
+        reg = self.p.nf_precond_reg * ctf2_max
+        gain = (ctf2_max + reg) / (ctf2 + reg)
+        return np.clip(gain, 1.0, self.p.nf_precond_gain)
+
+    def object_update(self):
+        """
+        Standard DM object update, optionally followed by a Fourier-domain
+        boost of the low-frequency content of the per-iteration increment.
+        """
+        if not self._nf_precond_active():
+            super().object_update()
+            return
+
+        # Snapshot the object so we can isolate this iteration's increment
+        snapshot = {name: s.data.copy() for name, s in self.ob.storages.items()}
+
+        super().object_update()
+
+        for name, s in self.ob.storages.items():
+            filt = self._nf_build_filter(name, s)
+            delta = s.data - snapshot[name]
+            # Boost low frequencies of the increment (FFT over last two axes)
+            delta_ft = np.fft.fft2(delta, axes=(-2, -1))
+            delta_ft *= filt
+            boosted = np.fft.ifft2(delta_ft, axes=(-2, -1)).astype(s.data.dtype)
+            s.data[:] = snapshot[name] + boosted
+            self.clip_object(s)
+
+    # ------------------------------------------------------------------ #
+    # Part 1: object-plane low-frequency convergence metric              #
+    # ------------------------------------------------------------------ #
+    def _nf_lowpass(self, data):
+        """
+        Low-pass the object (complex, over last two axes) with a soft Gaussian
+        mask keeping the band below `nf_metric_cutoff` * Nyquist.
+        """
+        ny, nx = data.shape[-2:]
+        fy = np.fft.fftfreq(ny)[:, None]
+        fx = np.fft.fftfreq(nx)[None, :]
+        f2 = fy ** 2 + fx ** 2
+        fc = self.p.nf_metric_cutoff * 0.5
+        mask = np.exp(-f2 / (fc ** 2 + 1e-12))
+        ft = np.fft.fft2(data, axes=(-2, -1)) * mask
+        return np.fft.ifft2(ft, axes=(-2, -1))
+
+    def _nf_compute_metric(self):
+        """
+        Relative change of the low-pass-filtered object between iterations,
+        averaged over object storages. A value that keeps decaying means the
+        halo is still evolving; a plateau means the low frequencies have settled.
+        Returns None on the very first call (no previous state yet).
+        """
+        rels = []
+        for name, s in self.ob.storages.items():
+            lp = self._nf_lowpass(s.data)
+            prev = self._nf_prev_lowpass.get(name)
+            self._nf_prev_lowpass[name] = lp
+            if prev is None or prev.shape != lp.shape:
+                continue
+            num = np.linalg.norm((lp - prev).ravel())
+            den = np.linalg.norm(lp.ravel()) + 1e-12
+            rels.append(num / den)
+        if not rels:
+            return None
+        return float(np.mean(rels))
+
+    def engine_iterate(self, num=1):
+        error_dct = super().engine_iterate(num)
+        if self.p.nf_metric:
+            self._nf_metric_value = self._nf_compute_metric()
+            if self._nf_metric_value is not None:
+                log(3, "DMNearfield: low-frequency metric = %.3e"
+                       % self._nf_metric_value)
+        return error_dct
+
+    def _fill_runtime(self):
+        super()._fill_runtime()
+        # Attach the metric to the just-appended iteration info
+        if self.p.nf_metric and self.ptycho.runtime.iter_info:
+            self.ptycho.runtime.iter_info[-1]['nf_metric'] = self._nf_metric_value
