@@ -42,7 +42,8 @@ import numpy as np
 
 from ptypy.engines import projectional
 from ptypy.engines import register
-from ptypy.utils.verbose import log
+from ptypy.utils import parallel
+from ptypy.utils.verbose import log, ilog_message
 
 
 @register()
@@ -71,13 +72,25 @@ class DMNearfield(projectional.DM):
           0.1 keeps the lowest 10 percent of frequencies, i.e. the band most\
           affected by the near-field CTF zero.
 
+    [nf_metric_interval]
+    default = 1
+    type = int
+    lowlim = 1
+    help = Compute the low-frequency metric every N iterations
+    doc = Each evaluation costs two FFTs over the full object, so increase this\
+          for very large objects if the diagnostic is not needed every iteration.
+
     [nf_precond]
     default = False
     type = bool
     help = Enable the Fourier-domain preconditioner of the object update
     doc = Amplifies the low-frequency content of the object *increment* to\
           accelerate the slowly-converging modes. The DM fixed point is\
-          preserved because the boost acts on the per-iteration increment only.
+          preserved because the boost acts on the per-iteration increment only.\
+          WARNING: in near-field the low frequencies are only weakly constrained\
+          (CTF ~ 0), so an over-aggressive boost is positive feedback and will\
+          diverge. Keep nf_precond_gain modest (<= ~2), prefer the 'ctf' method,\
+          and use nf_precond_ramp to avoid a sudden jolt.
 
     [nf_precond_start]
     default = 0
@@ -90,17 +103,32 @@ class DMNearfield(projectional.DM):
     type = int
     help = Number of iterations after which preconditioning stops (None = never)
 
+    [nf_precond_ramp]
+    default = 20
+    type = int
+    lowlim = 0
+    help = Number of iterations over which the boost ramps linearly from 1x to full
+    doc = Switching the boost on abruptly kicks the worst-conditioned modes and\
+          can destabilise near-field reconstructions. The effective boost grows\
+          from identity to the full filter over this many iterations after\
+          nf_precond_start. Set to 0 to switch on at full strength immediately.
+
     [nf_precond_method]
-    default = gain
+    default = ctf
     type = str
-    help = Preconditioner shape; 'gain' (robust Gaussian low-frequency boost) or 'ctf' (regularised inverse-CTF from the geometry)
-    choices = ['gain', 'ctf']
+    help = Preconditioner shape; 'ctf' (regularised inverse-CTF from the geometry, slowness-matched) or 'gain' (flat Gaussian low-frequency boost)
+    doc = 'ctf' amplifies each mode in proportion to how blind the near-field\
+          response is to it, so well-constrained modes are left near 1x. 'gain'\
+          boosts the whole low band equally and is more prone to overshoot.
+    choices = ['ctf', 'gain']
 
     [nf_precond_gain]
-    default = 4.0
+    default = 2.0
     type = float
     lowlim = 1.0
     help = Maximum amplification applied to the low frequencies of the increment
+    doc = Values much above ~2 are unsafe for near-field (positive feedback on\
+          weakly-constrained low frequencies). Increase cautiously.
 
     [nf_precond_cutoff]
     default = 0.1
@@ -152,11 +180,24 @@ class DMNearfield(projectional.DM):
                 return pod.geometry
         return None
 
-    def _nf_build_filter(self, name, storage):
+    def _nf_ramp_fraction(self):
         """
-        Build (and cache) the Fourier-domain amplification filter for a given
-        object storage, evaluated on its last two axes. The filter is >= 1 and
-        amplifies the low-frequency band; it multiplies FFT(increment).
+        Linear ramp of the boost strength from 0 (identity) to 1 (full filter)
+        over `nf_precond_ramp` iterations after `nf_precond_start`. Avoids the
+        destabilising jolt of switching a strong boost on abruptly.
+        """
+        ramp = self.p.nf_precond_ramp
+        if ramp <= 0:
+            return 1.0
+        frac = (self.curiter - self.p.nf_precond_start) / float(ramp)
+        return float(np.clip(frac, 0.0, 1.0))
+
+    def _nf_build_boost(self, name, storage):
+        """
+        Build (and cache) the Fourier-domain *boost shape* (filter - 1, so it is
+        >= 0 and zero where no amplification is wanted) for a given object
+        storage, evaluated on its last two axes. The effective per-iteration
+        filter is 1 + frac * boost, where frac is the ramp fraction.
         """
         shape = storage.data.shape[-2:]
         key = (name, shape, self.p.nf_precond_method)
@@ -176,9 +217,9 @@ class DMNearfield(projectional.DM):
         else:
             filt = self._nf_gain_filter(ny, nx)
 
-        filt = filt.astype(np.float32)
-        self._nf_filter_cache[key] = filt
-        return filt
+        boost = (filt - 1.0).astype(np.float32)
+        self._nf_filter_cache[key] = boost
+        return boost
 
     def _nf_gain_filter(self, ny, nx):
         """
@@ -234,13 +275,21 @@ class DMNearfield(projectional.DM):
             super().object_update()
             return
 
+        frac = self._nf_ramp_fraction()
+        if frac <= 0.0:
+            # Start of the ramp, zero boost strength: plain DM update
+            super().object_update()
+            return
+
         # Snapshot the object so we can isolate this iteration's increment
         snapshot = {name: s.data.copy() for name, s in self.ob.storages.items()}
 
         super().object_update()
 
         for name, s in self.ob.storages.items():
-            filt = self._nf_build_filter(name, s)
+            boost = self._nf_build_boost(name, s)
+            # Effective filter, ramped: 1 + frac * (filter - 1)
+            filt = 1.0 + frac * boost
             delta = s.data - snapshot[name]
             # Boost low frequencies of the increment (FFT over last two axes)
             delta_ft = np.fft.fft2(delta, axes=(-2, -1))
@@ -289,11 +338,16 @@ class DMNearfield(projectional.DM):
 
     def engine_iterate(self, num=1):
         error_dct = super().engine_iterate(num)
-        if self.p.nf_metric:
+        if self.p.nf_metric and (self.curiter % self.p.nf_metric_interval == 0):
             self._nf_metric_value = self._nf_compute_metric()
             if self._nf_metric_value is not None:
-                log(3, "DMNearfield: low-frequency metric = %.3e"
+                # log at INFO (verbose>=3) for the full log, and also emit the
+                # always-visible streaming line so it shows at any verbose level
+                msg = ("DMNearfield: low-frequency (halo) metric = %.3e"
                        % self._nf_metric_value)
+                log(3, msg)
+                if parallel.master:
+                    ilog_message(msg)
         return error_dct
 
     def _fill_runtime(self):
