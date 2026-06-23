@@ -251,6 +251,47 @@ class DMNearfield(projectional.DM):
           intermediate values let them adapt slowly. High frequencies always\
           update at full strength.
 
+    [nf_anderson]
+    default = False
+    type = bool
+    help = Anderson-accelerate the DM object fixed-point iteration
+    doc = Anderson (DIIS) extrapolation from the last few object iterates cancels\
+          the slowest-decaying eigenmodes of the iteration -- which in near-field\
+          are the low-frequency modes -- often cutting the iteration count\
+          substantially. Wraps whatever inner update is configured (it composes\
+          with the preconditioner / constraints). Memory cost: ~2*depth copies of\
+          the object. Object-only; the probe follows the plain DM update.
+
+    [nf_anderson_depth]
+    default = 4
+    type = int
+    lowlim = 1
+    uplim = 20
+    help = Number of past iterates used in the Anderson extrapolation (history m)
+
+    [nf_anderson_start]
+    default = 5
+    type = int
+    lowlim = 0
+    help = Number of iterations before Anderson acceleration starts
+    doc = Let plain DM establish coarse structure first; extrapolating from a\
+          wild early transient can destabilise.
+
+    [nf_anderson_beta]
+    default = 1.0
+    type = float
+    lowlim = 0.0
+    uplim = 1.0
+    help = Anderson mixing (relaxation) factor; 1.0 is the standard choice
+
+    [nf_anderson_reg]
+    default = 1e-8
+    type = float
+    lowlim = 0.0
+    help = Relative ridge regularisation for the Anderson least-squares solve
+    doc = Stabilises the (often ill-conditioned) extrapolation. Increase if the\
+          accelerated iteration becomes noisy.
+
     """
 
     def __init__(self, ptycho_parent, pars=None):
@@ -261,6 +302,8 @@ class DMNearfield(projectional.DM):
         self._nf_filter_cache = {}
         # Per-storage cache of the auto anchor mask: name -> (iter, mask)
         self._nf_auto_mask = {}
+        # Anderson acceleration history: name -> {'x': [...], 'f': [...]}
+        self._nf_aa = {}
         # Latest metric value, surfaced through _fill_runtime
         self._nf_metric_value = None
 
@@ -608,8 +651,62 @@ class DMNearfield(projectional.DM):
             return None
         return float(np.mean(rels))
 
+    # ------------------------------------------------------------------ #
+    # Optional: Anderson acceleration of the object fixed-point iteration #
+    # ------------------------------------------------------------------ #
+    def _nf_anderson_active(self):
+        return self.p.nf_anderson and self.curiter >= self.p.nf_anderson_start
+
+    def _nf_anderson_apply(self, x_pre):
+        """
+        Anderson (DIIS) extrapolation on each object storage. `x_pre` holds the
+        flattened object iterate x_k from *before* the DM step; the current
+        object is the DM image g_k. Produces x_{k+1} by cancelling the slowest
+        eigenmodes from the last `depth` iterates and writes it back.
+        """
+        m = int(self.p.nf_anderson_depth)
+        beta = float(self.p.nf_anderson_beta)
+        for name, s in self.ob.storages.items():
+            g = s.data.ravel().copy()
+            x = x_pre[name]
+            f = g - x
+            hist = self._nf_aa.setdefault(name, {'x': [], 'f': []})
+            hist['x'].append(x)
+            hist['f'].append(f)
+            if len(hist['x']) > m + 1:
+                hist['x'].pop(0)
+                hist['f'].pop(0)
+
+            n = len(hist['x'])
+            if n < 2:
+                x_next = x + beta * f
+            else:
+                Xh, Fh = hist['x'], hist['f']
+                dX = np.stack([Xh[i + 1] - Xh[i] for i in range(n - 1)], axis=1)
+                dF = np.stack([Fh[i + 1] - Fh[i] for i in range(n - 1)], axis=1)
+                # Ridge-regularised normal equations: small (n-1)x(n-1) solve.
+                A = dF.conj().T @ dF
+                lam = self.p.nf_anderson_reg * (np.trace(A).real / A.shape[0]
+                                                + 1e-30)
+                A = A + lam * np.eye(A.shape[0], dtype=A.dtype)
+                gamma = np.linalg.solve(A, dF.conj().T @ f)
+                x_next = x + beta * f - (dX + beta * dF) @ gamma
+
+            if not np.all(np.isfinite(x_next)):
+                x_next = g  # fall back to the plain DM step
+                hist['x'].clear()
+                hist['f'].clear()
+            s.data[:] = x_next.reshape(s.data.shape)
+            self.clip_object(s)
+
     def engine_iterate(self, num=1):
-        error_dct = super().engine_iterate(num)
+        if self._nf_anderson_active():
+            x_pre = {name: s.data.ravel().copy()
+                     for name, s in self.ob.storages.items()}
+            error_dct = super().engine_iterate(num)
+            self._nf_anderson_apply(x_pre)
+        else:
+            error_dct = super().engine_iterate(num)
         if self.p.nf_metric and (self.curiter % self.p.nf_metric_interval == 0):
             self._nf_metric_value = self._nf_compute_metric()
             if self._nf_metric_value is not None:
