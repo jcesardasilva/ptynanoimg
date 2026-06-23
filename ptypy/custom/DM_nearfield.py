@@ -214,6 +214,43 @@ class DMNearfield(projectional.DM):
     help = Also reset the object amplitude in the masked region to unity
     doc = Use when the known-empty region should be pure vacuum (unit amplitude).
 
+    [nf_probe_lf_anchor]
+    default = False
+    type = bool
+    help = Anchor the probe low frequencies to remove the object-probe LF gauge
+    doc = The object and probe share a low-frequency gauge freedom (O -> O g,\
+          P -> P / g) that in near-field is a near-null direction of the\
+          iteration -- the dominant cause of slow low-frequency convergence.\
+          When enabled, the low-frequency content of the per-iteration probe\
+          *increment* is attenuated, so low-frequency corrections are absorbed\
+          by the object rather than drifting into the probe. This anchors the\
+          gauge to the (well-characterised) initial probe wavefront while still\
+          letting the speckle / high-frequency probe structure refine. It is the\
+          generalisation of seeding a good probe and freezing it early.
+
+    [nf_probe_lf_start]
+    default = 0
+    type = int
+    lowlim = 0
+    help = Number of iterations before the probe low-frequency anchor starts
+
+    [nf_probe_lf_cutoff]
+    default = 0.1
+    type = float
+    lowlim = 0.0
+    uplim = 1.0
+    help = Probe-anchor low-frequency band, as a fraction of the Nyquist frequency
+
+    [nf_probe_lf_damp]
+    default = 0.0
+    type = float
+    lowlim = 0.0
+    uplim = 1.0
+    help = Retained fraction of the low-frequency probe increment (0 = freeze, 1 = off)
+    doc = 0.0 fully freezes the probe low frequencies (strongest gauge fix);\
+          intermediate values let them adapt slowly. High frequencies always\
+          update at full strength.
+
     """
 
     def __init__(self, ptycho_parent, pars=None):
@@ -374,6 +411,51 @@ class DMNearfield(projectional.DM):
             boosted = np.fft.ifft2(delta_ft, axes=(-2, -1)).astype(s.data.dtype)
             s.data[:] = snapshot[name] + boosted
             self.clip_object(s)
+
+    # ------------------------------------------------------------------ #
+    # Optional: probe low-frequency gauge anchor                         #
+    # ------------------------------------------------------------------ #
+    def _nf_probe_anchor_active(self):
+        return (self.p.nf_probe_lf_anchor
+                and self.curiter >= self.p.nf_probe_lf_start)
+
+    def _nf_probe_filter(self, name, storage):
+        """
+        Attenuation filter for the probe increment: `damp` over the low-frequency
+        band, 1 at high frequencies, so D(f) = 1 - (1 - damp) * lowpass(f).
+        Cached per (name, shape).
+        """
+        shape = storage.data.shape[-2:]
+        key = ('probe', name, shape)
+        cached = self._nf_filter_cache.get(key)
+        if cached is not None:
+            return cached
+        ny, nx = shape
+        fy = np.fft.fftfreq(ny)[:, None]
+        fx = np.fft.fftfreq(nx)[None, :]
+        fc = self.p.nf_probe_lf_cutoff * 0.5
+        lowpass = np.exp(-(fy ** 2 + fx ** 2) / (fc ** 2 + 1e-12))
+        D = (1.0 - (1.0 - self.p.nf_probe_lf_damp) * lowpass).astype(np.float32)
+        self._nf_filter_cache[key] = D
+        return D
+
+    def probe_update(self):
+        """
+        Standard DM probe update, optionally with the low-frequency content of
+        the probe increment attenuated to remove the object-probe gauge drift.
+        """
+        if not self._nf_probe_anchor_active():
+            return super().probe_update()
+
+        snapshot = {name: s.data.copy() for name, s in self.pr.storages.items()}
+        change = super().probe_update()
+        for name, s in self.pr.storages.items():
+            D = self._nf_probe_filter(name, s)
+            dP = s.data - snapshot[name]
+            dP_ft = np.fft.fft2(dP, axes=(-2, -1)) * D
+            s.data[:] = snapshot[name] + np.fft.ifft2(
+                dP_ft, axes=(-2, -1)).astype(s.data.dtype)
+        return change
 
     # ------------------------------------------------------------------ #
     # Optional: low-frequency phase-reference constraint                 #
