@@ -145,6 +145,48 @@ class DMNearfield(projectional.DM):
     doc = Larger values are more conservative, capping the amplification near\
           the CTF zeros to suppress noise.
 
+    [nf_lf_constraint]
+    default = False
+    type = bool
+    help = Pin the low-frequency phase reference using a known-empty region
+    doc = The single-distance near-field CTF is blind at f=0, so the smooth\
+          (low-order) phase background is unconstrained and drifts as the halo.\
+          When enabled, a low-order 2D polynomial is fitted to the object phase\
+          over the `nf_lf_mask` region (which you know should be flat) and\
+          subtracted from the whole object each iteration, anchoring that\
+          reference. This complements the preconditioner: the preconditioner\
+          speeds up the weakly-constrained modes, the constraint pins the\
+          truly-unconstrained ones.
+
+    [nf_lf_mask]
+    default = None
+    type = ndarray
+    help = Boolean mask (object Y-X shape), True over a known-empty/flat region
+    doc = Required when nf_lf_constraint is enabled. Cast to bool. Must match\
+          the last two axes of the object storage.
+
+    [nf_lf_order]
+    default = 2
+    type = int
+    lowlim = 0
+    uplim = 4
+    help = Polynomial order of the background phase removed by the constraint
+    doc = 0 removes a constant phase offset, 1 also removes tilt (a phase ramp),\
+          2 additionally removes the quadratic curvature that dominates the\
+          near-field halo (residual parabolic phase from the CTF zero at DC).
+
+    [nf_lf_start]
+    default = 0
+    type = int
+    lowlim = 0
+    help = Number of iterations before the low-frequency constraint starts
+
+    [nf_lf_pin_amplitude]
+    default = False
+    type = bool
+    help = Also reset the object amplitude in the masked region to unity
+    doc = Use when the known-empty region should be pure vacuum (unit amplitude).
+
     """
 
     def __init__(self, ptycho_parent, pars=None):
@@ -268,9 +310,15 @@ class DMNearfield(projectional.DM):
 
     def object_update(self):
         """
-        Standard DM object update, optionally followed by a Fourier-domain
-        boost of the low-frequency content of the per-iteration increment.
+        Standard DM object update, optionally followed by (i) a Fourier-domain
+        boost of the low-frequency content of the per-iteration increment and
+        (ii) a low-frequency phase-reference constraint.
         """
+        self._nf_object_update_core()
+        if self._nf_lf_active():
+            self._nf_apply_lf_constraint()
+
+    def _nf_object_update_core(self):
         if not self._nf_precond_active():
             super().object_update()
             return
@@ -296,6 +344,75 @@ class DMNearfield(projectional.DM):
             delta_ft *= filt
             boosted = np.fft.ifft2(delta_ft, axes=(-2, -1)).astype(s.data.dtype)
             s.data[:] = snapshot[name] + boosted
+            self.clip_object(s)
+
+    # ------------------------------------------------------------------ #
+    # Optional: low-frequency phase-reference constraint                 #
+    # ------------------------------------------------------------------ #
+    def _nf_lf_active(self):
+        if not self.p.nf_lf_constraint:
+            return False
+        if self.p.nf_lf_mask is None:
+            log(2, "DMNearfield: nf_lf_constraint enabled but nf_lf_mask is "
+                   "None; skipping the low-frequency constraint.")
+            return False
+        return self.curiter >= self.p.nf_lf_start
+
+    def _nf_poly_basis(self, ny, nx, order):
+        """
+        Stack of 2D monomial basis images x^i y^j (i+j <= order) on a grid
+        normalised to [-1, 1] for conditioning. Returns an (nterms, ny, nx)
+        array, cached per (shape, order).
+        """
+        key = ('polybasis', ny, nx, order)
+        cached = self._nf_filter_cache.get(key)
+        if cached is not None:
+            return cached
+        yy, xx = np.meshgrid(np.linspace(-1, 1, ny),
+                             np.linspace(-1, 1, nx), indexing='ij')
+        terms = []
+        for total in range(order + 1):
+            for i in range(total + 1):
+                terms.append((xx ** i) * (yy ** (total - i)))
+        basis = np.asarray(terms, dtype=np.float64)
+        self._nf_filter_cache[key] = basis
+        return basis
+
+    def _nf_apply_lf_constraint(self):
+        """
+        Fit a low-order polynomial to the object phase over the known-empty
+        `nf_lf_mask` region and subtract that smooth phase from the whole
+        object, anchoring the otherwise-unconstrained low-frequency reference.
+        """
+        mask = np.asarray(self.p.nf_lf_mask).astype(bool)
+        order = int(self.p.nf_lf_order)
+        for name, s in self.ob.storages.items():
+            ny, nx = s.data.shape[-2:]
+            if mask.shape != (ny, nx):
+                log(2, "DMNearfield: nf_lf_mask shape %s != object %s for "
+                       "storage %s; skipping." % (mask.shape, (ny, nx), name))
+                continue
+            basis = self._nf_poly_basis(ny, nx, order)        # (nterms, ny, nx)
+            m = mask.ravel()
+            A = basis.reshape(basis.shape[0], -1).T            # (npix, nterms)
+            Am = A[m]
+            # Fit each object mode independently
+            for k in range(s.data.shape[0]):
+                vals = s.data[k].ravel()[m]
+                # Amplitude-weight the fit so flat-vacuum pixels (|.| ~ 1)
+                # dominate and near-zero/uncovered pixels contribute nothing.
+                w = np.abs(vals)
+                # Work relative to the (amplitude-weighted) masked mean to
+                # avoid phase wrapping in the fit.
+                ref = np.angle(np.sum(vals))
+                pm = np.angle(vals * np.exp(-1j * ref))
+                sw = np.sqrt(w)
+                coeffs, *_ = np.linalg.lstsq(Am * sw[:, None], pm * sw, rcond=None)
+                fit_full = (A @ coeffs).reshape(ny, nx) + ref
+                s.data[k] *= np.exp(-1j * fit_full).astype(s.data.dtype)
+                if self.p.nf_lf_pin_amplitude:
+                    # Reset masked amplitude to unity, keep the phase
+                    s.data[k][mask] = np.exp(1j * np.angle(s.data[k][mask]))
             self.clip_object(s)
 
     # ------------------------------------------------------------------ #
