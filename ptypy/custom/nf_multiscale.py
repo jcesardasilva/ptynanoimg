@@ -139,6 +139,10 @@ def run_multiscale(p, bins=(4, 2, 1), iters=None, engine_label=None,
 
     prev = None
     P = None
+    # Combined convergence history across all levels, with a running global
+    # iteration index and the level / rebin tagged on each entry.
+    combined_history = []
+    global_iter = 0
     for level, (b, nit) in enumerate(zip(bins, iters)):
         log(3, '\n' + headerline(
             'Multiscale level %d/%d: rebin=%d, iters=%d'
@@ -158,6 +162,19 @@ def run_multiscale(p, bins=(4, 2, 1), iters=None, engine_label=None,
         P.run()
         P.finalize()
 
+        # Accumulate this level's per-iteration info into the combined history.
+        for info in P.runtime.iter_info:
+            global_iter += 1
+            entry = dict(info)
+            entry['level'] = level
+            entry['rebin'] = b
+            entry['level_iteration'] = info['iteration']
+            entry['global_iteration'] = global_iter
+            combined_history.append(entry)
+
         prev = _extract(P)
 
+    # Expose the cross-level history on the returned Ptycho. (P.runtime.iter_info
+    # itself only ever holds the final level, since each level is a fresh run.)
+    P.runtime.multiscale_iter_info = combined_history
     return P
