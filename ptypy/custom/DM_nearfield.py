@@ -162,8 +162,35 @@ class DMNearfield(projectional.DM):
     default = None
     type = ndarray
     help = Boolean mask (object Y-X shape), True over a known-empty/flat region
-    doc = Required when nf_lf_constraint is enabled. Cast to bool. Must match\
-          the last two axes of the object storage.
+    doc = Manual mask of the flat/vacuum region used to anchor the phase. Cast\
+          to bool, must match the last two axes of the object storage. If None\
+          and nf_lf_auto is True, the mask is detected from the data instead.
+
+    [nf_lf_auto]
+    default = True
+    type = bool
+    help = Auto-detect the flat/vacuum region from the current object estimate
+    doc = Avoids hard-coding a mask. The flattest fraction of the field (low\
+          phase/amplitude gradient and amplitude near the modal transmission) is\
+          selected as the anchor region and refreshed periodically. A manual\
+          nf_lf_mask, when provided, always takes precedence.
+
+    [nf_lf_auto_quantile]
+    default = 0.3
+    type = float
+    lowlim = 0.01
+    uplim = 0.9
+    help = Fraction of the flattest pixels selected as the auto anchor region
+    doc = 0.3 keeps the smoothest 30 percent of the field. Lower is stricter\
+          (only the very flattest vacuum); higher includes more of the field.
+
+    [nf_lf_auto_refresh]
+    default = 10
+    type = int
+    lowlim = 1
+    help = Recompute the auto mask every N iterations
+    doc = The object improves as iterations proceed, so the detected flat region\
+          is refreshed periodically rather than fixed once.
 
     [nf_lf_order]
     default = 2
@@ -195,6 +222,8 @@ class DMNearfield(projectional.DM):
         self._nf_prev_lowpass = {}
         # Per-storage cache of the preconditioner filter, keyed by (name, shape)
         self._nf_filter_cache = {}
+        # Per-storage cache of the auto anchor mask: name -> (iter, mask)
+        self._nf_auto_mask = {}
         # Latest metric value, surfaced through _fill_runtime
         self._nf_metric_value = None
 
@@ -352,11 +381,54 @@ class DMNearfield(projectional.DM):
     def _nf_lf_active(self):
         if not self.p.nf_lf_constraint:
             return False
-        if self.p.nf_lf_mask is None:
+        if self.p.nf_lf_mask is None and not self.p.nf_lf_auto:
             log(2, "DMNearfield: nf_lf_constraint enabled but nf_lf_mask is "
-                   "None; skipping the low-frequency constraint.")
+                   "None and nf_lf_auto is False; skipping the constraint.")
             return False
         return self.curiter >= self.p.nf_lf_start
+
+    def _nf_detect_flat_region(self, ob2d):
+        """
+        Data-driven detection of the flat/vacuum anchor region from a 2D complex
+        object estimate: select the smoothest fraction of the field, i.e. pixels
+        with small local gradient AND amplitude close to the modal transmission.
+        Returns a boolean mask. No hard-coded geometry.
+        """
+        a = np.abs(ob2d)
+        # Local roughness from the complex gradient (phase + amplitude texture)
+        gy, gx = np.gradient(ob2d)
+        rough = np.abs(gx) + np.abs(gy)
+        # Amplitude deviation from the modal (median) transmission
+        amp_dev = np.abs(a - np.median(a))
+        # Normalise each cue by its own 95th percentile for scale-invariance
+        def _norm(x):
+            s = np.percentile(x, 95)
+            return x / (s + 1e-12)
+        score = _norm(rough) + _norm(amp_dev)
+        # Keep the flattest fraction of the field
+        thr = np.percentile(score, 100.0 * self.p.nf_lf_auto_quantile)
+        mask = score <= thr
+        return mask
+
+    def _nf_get_mask(self, name, storage):
+        """
+        Return the anchor mask for a storage: the manual nf_lf_mask if given,
+        otherwise the auto-detected flat region (refreshed every
+        nf_lf_auto_refresh iterations and cached per storage).
+        """
+        if self.p.nf_lf_mask is not None:
+            return np.asarray(self.p.nf_lf_mask).astype(bool)
+        cache = self._nf_auto_mask
+        entry = cache.get(name)
+        refresh = (entry is None or
+                   (self.curiter - entry[0]) >= self.p.nf_lf_auto_refresh)
+        if refresh:
+            mask = self._nf_detect_flat_region(storage.data[0])
+            cache[name] = (self.curiter, mask)
+            log(3, "DMNearfield: auto anchor mask for %s = %d pixels (%.0f%%)"
+                   % (name, mask.sum(), 100.0 * mask.mean()))
+            return mask
+        return entry[1]
 
     def _nf_poly_basis(self, ny, nx, order):
         """
@@ -380,16 +452,17 @@ class DMNearfield(projectional.DM):
 
     def _nf_apply_lf_constraint(self):
         """
-        Fit a low-order polynomial to the object phase over the known-empty
-        `nf_lf_mask` region and subtract that smooth phase from the whole
-        object, anchoring the otherwise-unconstrained low-frequency reference.
+        Fit a low-order polynomial to the object phase over the flat/vacuum
+        anchor region (manual nf_lf_mask or auto-detected) and subtract that
+        smooth phase from the whole object, anchoring the otherwise-unconstrained
+        low-frequency reference.
         """
-        mask = np.asarray(self.p.nf_lf_mask).astype(bool)
         order = int(self.p.nf_lf_order)
         for name, s in self.ob.storages.items():
             ny, nx = s.data.shape[-2:]
+            mask = self._nf_get_mask(name, s)
             if mask.shape != (ny, nx):
-                log(2, "DMNearfield: nf_lf_mask shape %s != object %s for "
+                log(2, "DMNearfield: anchor mask shape %s != object %s for "
                        "storage %s; skipping." % (mask.shape, (ny, nx), name))
                 continue
             basis = self._nf_poly_basis(ny, nx, order)        # (nterms, ny, nx)
