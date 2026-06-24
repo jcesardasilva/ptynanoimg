@@ -106,6 +106,8 @@ def main():
     pos = xp.asarray(pos)
 
     bh = BHPtycho(n, npsi, pad, ex, npos, voxelsize, distance, wavelength, xp=xp)
+    print("FFT sizes: npatch=%d  nprop=%d  (rounded to cuFFT-friendly 7-smooth)"
+          % (bh.npatch, bh.nprop), flush=True)
 
     # ----------------------- initial guesses ----------------------------- #
     print("building initial guess (probe + Paganin object, delta_beta=%.0f)..."

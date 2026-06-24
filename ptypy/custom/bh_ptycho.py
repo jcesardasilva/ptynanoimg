@@ -46,6 +46,25 @@ authors: distilled & documented for J. C. da Silva
 import numpy as np
 
 
+def _is_smooth(m, primes=(2, 3, 5, 7)):
+    """True if m factorizes into only the given small primes (cuFFT-fast)."""
+    for p in primes:
+        while m % p == 0:
+            m //= p
+    return m == 1
+
+
+def _good_fft_size(m, parity=None):
+    """Smallest 7-smooth integer >= m (cuFFT-friendly). If `parity` is given
+    (0 even, 1 odd), the result also matches that parity -- used so that
+    (npatch - nq) stays even and the shift border `ex` is an integer."""
+    k = int(m)
+    while True:
+        if (parity is None or k % 2 == parity) and _is_smooth(k):
+            return k
+        k += 1
+
+
 class BHPtycho:
     """
     Geometry + operators + BH-CG reconstruction for near-field ptychography.
@@ -66,18 +85,26 @@ class BHPtycho:
         self.n = n
         self.npsi = npsi
         self.pad = pad
-        self.ex = ex
         self.npos = npos
         self.nq = n + 2 * pad
-        self.npatch = self.nq + 2 * ex
+        # The patch FFT length (npatch) must be cuFFT-friendly: a size with a
+        # large prime factor (e.g. nq+16 = 16*73) sends cuFFT to the slow
+        # Bluestein path and can look like a hang on GPU. Round npatch up to the
+        # nearest 7-smooth size by enlarging the shift border `ex` (>= requested).
+        self.npatch = _good_fft_size(self.nq + 2 * ex, parity=self.nq % 2)
+        self.ex = (self.npatch - self.nq) // 2
         self.voxelsize = voxelsize
         self.distance = distance
         self.wavelength = wavelength
         self.eps = eps
 
-        # Near-field Fresnel propagation kernel (angular spectrum), built on a
-        # grid padded to 2*nq so the convolution below has no wrap-around.
-        fx = xp.fft.fftfreq(self.nq * 2, d=voxelsize).astype("float32")
+        # Propagator FFT length: pad to >= 2*nq (no wrap-around), 7-smooth.
+        self.nprop = _good_fft_size(2 * self.nq, parity=0)
+        self._plo = (self.nprop - self.nq) // 2
+        self._phi = self.nprop - self.nq - self._plo
+
+        # Near-field Fresnel propagation kernel (angular spectrum) on the nprop grid.
+        fx = xp.fft.fftfreq(self.nprop, d=voxelsize).astype("float32")
         fx, fy = xp.meshgrid(fx, fx)
         self.fker = xp.exp(-1j * xp.pi * wavelength * distance * (fx ** 2 + fy ** 2))
 
@@ -119,21 +146,21 @@ class BHPtycho:
     def D(self, psi):
         """Forward near-field propagation, then crop probe->detector size."""
         xp = self.xp
-        nq, pad = self.nq, self.pad
-        ff = xp.pad(psi, ((0, 0), (nq // 2, nq // 2), (nq // 2, nq // 2)))
+        nq, pad, plo = self.nq, self.pad, self._plo
+        ff = xp.pad(psi, ((0, 0), (plo, self._phi), (plo, self._phi)))  # nq -> nprop
         ff = xp.fft.ifft2(xp.fft.fft2(ff) * self.fker)
-        ff = ff[:, nq // 2:-nq // 2, nq // 2:-nq // 2]
-        ff = ff[:, pad:nq - pad, pad:nq - pad]
+        ff = ff[:, plo:plo + nq, plo:plo + nq]                          # -> nq (center)
+        ff = ff[:, pad:nq - pad, pad:nq - pad]                          # -> n (detector)
         return ff
 
     def DT(self, psi):
         """Adjoint propagation: pad detector->probe, back-propagate."""
         xp = self.xp
-        nq, pad = self.nq, self.pad
-        ff = xp.pad(psi, ((0, 0), (pad, pad), (pad, pad)))
-        ff = xp.pad(ff, ((0, 0), (nq // 2, nq // 2), (nq // 2, nq // 2)))
+        nq, pad, plo = self.nq, self.pad, self._plo
+        ff = xp.pad(psi, ((0, 0), (pad, pad), (pad, pad)))              # n -> nq
+        ff = xp.pad(ff, ((0, 0), (plo, self._phi), (plo, self._phi)))   # nq -> nprop
         ff = xp.fft.ifft2(xp.fft.fft2(ff) / self.fker)
-        ff = ff[:, nq // 2:-nq // 2, nq // 2:-nq // 2]
+        ff = ff[:, plo:plo + nq, plo:plo + nq]                          # -> nq (center)
         return ff
 
     # ------------------------------------------------------------------ #
