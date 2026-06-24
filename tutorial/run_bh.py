@@ -37,7 +37,11 @@ BHPtycho = _bh.BHPtycho
 _good_fft_size = _bh._good_fft_size
 
 # ----------------------------- settings ----------------------------------- #
-DATA = "Ecat_2nd_time_NFP_070nm_subtomo001_0000.h5"
+# Data file: BH_DATA env override, else the file sitting next to this script,
+# so it works regardless of the current working directory.
+DATA = os.environ.get("BH_DATA", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "Ecat_2nd_time_NFP_070nm_subtomo001_0000.h5"))
 # Defaults can be overridden from the shell with environment variables, so no
 # file editing is needed on the cluster, e.g.:
 #   BH_GPU=1 BH_BIN=1 BH_DELTA_BETA=500 BH_NITER=200 python run_bh.py
