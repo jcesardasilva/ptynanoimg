@@ -105,7 +105,7 @@ def _inject(P, prev):
 
 
 def run_multiscale(p, bins=(4, 2, 1), iters=None, engine_label=None,
-                   interp_order=1):
+                   interp_order=1, refine_probe='final', level_overrides=None):
     """
     Run a coarse-to-fine near-field reconstruction.
 
@@ -120,8 +120,21 @@ def run_multiscale(p, bins=(4, 2, 1), iters=None, engine_label=None,
         Number of iterations per level. Defaults to scaling the engine's
         configured numiter as bin^2 (coarse levels are cheap and converge the
         low frequencies fast). Length must match `bins` if given.
+    refine_probe : {'final', 'all', 'last_k:<int>'} or sequence of bool
+        Controls which levels update the probe. With only a handful of scan
+        positions the object/probe separation is weakly constrained, and at
+        coarse levels it is worse -- a free probe there absorbs object structure
+        (object-probe crosstalk) which the cascade then upsamples and bakes in.
+        'final' (default) updates the probe only at the finest level, holding it
+        fixed (at the injected estimate) while the coarse levels develop the
+        object low frequencies. 'all' updates at every level (legacy). A boolean
+        sequence (length == bins) gives per-level control. On levels where the
+        probe is frozen, the engine's probe_update_start is pushed past numiter.
     engine_label : str, optional
         Which engine's numiter to override per level. Defaults to the first.
+    level_overrides : sequence of dict, optional
+        Per-level engine-parameter overrides (length == bins), merged into the
+        engine params for that level. For advanced per-scale tuning.
     interp_order : int
         Spline order for the inter-level object/probe upsampling (1 = linear).
 
@@ -137,6 +150,22 @@ def run_multiscale(p, bins=(4, 2, 1), iters=None, engine_label=None,
         iters = [int(base_iters * (b ** 2)) for b in bins]
     assert len(iters) == len(bins), "iters must match bins in length"
 
+    # Resolve which levels update the probe.
+    nlev = len(bins)
+    if isinstance(refine_probe, str):
+        if refine_probe == 'all':
+            probe_on = [True] * nlev
+        elif refine_probe == 'final':
+            probe_on = [i == nlev - 1 for i in range(nlev)]
+        elif refine_probe.startswith('last_k:'):
+            k = int(refine_probe.split(':', 1)[1])
+            probe_on = [i >= nlev - k for i in range(nlev)]
+        else:
+            raise ValueError("Unknown refine_probe: %r" % refine_probe)
+    else:
+        probe_on = list(refine_probe)
+        assert len(probe_on) == nlev, "refine_probe sequence must match bins"
+
     prev = None
     P = None
     # Combined convergence history across all levels, with a running global
@@ -145,13 +174,20 @@ def run_multiscale(p, bins=(4, 2, 1), iters=None, engine_label=None,
     global_iter = 0
     for level, (b, nit) in enumerate(zip(bins, iters)):
         log(3, '\n' + headerline(
-            'Multiscale level %d/%d: rebin=%d, iters=%d'
-            % (level + 1, len(bins), b, nit), 'c'))
+            'Multiscale level %d/%d: rebin=%d, iters=%d, probe_update=%s'
+            % (level + 1, nlev, b, nit, probe_on[level]), 'c'))
 
         pl = copy.deepcopy(p)
         for scan in pl.scans.values():
             scan.data.rebin = b
-        pl.engines[engine_label].numiter = nit
+        eng = pl.engines[engine_label]
+        eng.numiter = nit
+        # Freeze the probe on levels that should not refine it, by pushing the
+        # probe-update start beyond the iteration count for that level.
+        if not probe_on[level]:
+            eng.probe_update_start = nit + 1
+        if level_overrides is not None and level_overrides[level]:
+            eng.update(level_overrides[level])
 
         # Initialise containers without running the engines, so we can seed
         # the object/probe from the previous (coarser) level first.
