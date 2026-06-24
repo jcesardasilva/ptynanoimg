@@ -42,8 +42,13 @@ RHO = (1.0, 2.0)       # object/probe preconditioning scales (Appendix II)
 
 if USE_GPU:
     import cupy as xp
+    _dev = xp.cuda.Device()
+    _free, _total = xp.cuda.runtime.memGetInfo()
+    print("GPU backend: CuPy on device %d, free %.1f / %.1f GB"
+          % (_dev.id, _free / 1e9, _total / 1e9), flush=True)
 else:
     xp = np
+    print("CPU backend: NumPy", flush=True)
 
 
 def bin2(a, b):
@@ -93,9 +98,9 @@ def main():
     pos -= pos.mean(0)  # center the position cloud
 
     print("energy=%.2f keV  lambda=%.3e m  distance=%.4f m  voxel=%.1f nm (bin %d)"
-          % (energy, wavelength, distance, voxelsize * 1e9, BIN))
+          % (energy, wavelength, distance, voxelsize * 1e9, BIN), flush=True)
     print("npos=%d  n=%d  npsi=%d  nq=%d  pos span px: y=%.0f x=%.0f"
-          % (npos, n, npsi, nq, np.ptp(pos[:, 0]), np.ptp(pos[:, 1])))
+          % (npos, n, npsi, nq, np.ptp(pos[:, 0]), np.ptp(pos[:, 1])), flush=True)
 
     data = xp.asarray(data)
     pos = xp.asarray(pos)
@@ -103,6 +108,8 @@ def main():
     bh = BHPtycho(n, npsi, pad, ex, npos, voxelsize, distance, wavelength, xp=xp)
 
     # ----------------------- initial guesses ----------------------------- #
+    print("building initial guess (probe + Paganin object, delta_beta=%.0f)..."
+          % DELTA_BETA, flush=True)
     ri = xp.round(pos).astype("int32")
     # reference (empty-beam proxy): average data over positions
     dref = data.mean(0)
@@ -122,18 +129,22 @@ def main():
     psi_init = xp.exp(1j * (obj_phase / weight)).astype("complex64")
 
     # ----------------------- reconstruction ------------------------------ #
+    print("starting BH-CG (%d iters). First GPU iteration includes cuFFT "
+          "planning and can take a while; later iterations are fast." % NITER,
+          flush=True)
     t0 = time.time()
     errs = []
 
     def cb(i, err, v):
-        if i % 5 == 0:
-            print("  iter %3d   error = %.5e   (%.1fs)" % (i, err, time.time() - t0),
-                  flush=True)
+        # print every iteration so progress is always visible
+        print("  iter %3d   error = %.5e   (%.1fs)" % (i, err, time.time() - t0),
+              flush=True)
 
     psi, q, errs = bh.reconstruct(data, psi_init.copy(), q_init.copy(), pos,
                                   niter=NITER, method="BH-CG", rho=RHO, callback=cb)
     print("done: error %.4e -> %.4e (%.2fx) in %d iters, %.1fs"
-          % (errs[0], errs[-1], errs[-1] / errs[0], NITER, time.time() - t0))
+          % (errs[0], errs[-1], errs[-1] / errs[0], NITER, time.time() - t0),
+          flush=True)
 
     # ----------------------- save + plot --------------------------------- #
     to_host = (lambda a: a.get()) if USE_GPU else (lambda a: a)
