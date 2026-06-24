@@ -89,13 +89,18 @@ def main():
     # Geometry sizes (mirror the reference demo)
     pad = n // 16
     ex = 8
-    npsi = n + n // 4
     nq = n + 2 * pad
 
     # Positions: micrometres -> sample-plane pixels; pos[:,0]=y, pos[:,1]=x
     pos = np.stack([posy * 1e-6 / voxelsize,
                     posx * 1e-6 / voxelsize], axis=1).astype("float32")
     pos -= pos.mean(0)  # center the position cloud
+
+    # Object size must hold the (rounded) patch plus the position spread.
+    from ptypy.custom.bh_ptycho import _good_fft_size
+    npatch_est = _good_fft_size(nq + 2 * ex, parity=nq % 2)
+    maxshift = int(np.ceil(np.abs(pos).max()))
+    npsi = max(n + n // 4, npatch_est + 2 * maxshift + 16)
 
     print("energy=%.2f keV  lambda=%.3e m  distance=%.4f m  voxel=%.1f nm (bin %d)"
           % (energy, wavelength, distance, voxelsize * 1e9, BIN), flush=True)
