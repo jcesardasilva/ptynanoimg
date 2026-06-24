@@ -28,10 +28,16 @@ from ptypy.custom.bh_ptycho import BHPtycho
 
 # ----------------------------- settings ----------------------------------- #
 DATA = "Ecat_2nd_time_NFP_070nm_subtomo001_0000.h5"
-USE_GPU = False        # True on the cluster (CuPy)
-BIN = 4                # detector binning; 1 = full res (use on GPU), 4 = CPU test
-NITER = 60
-DELTA_BETA = 24.05     # Paganin delta/beta for the object init (tune per sample)
+# Defaults can be overridden from the shell with environment variables, so no
+# file editing is needed on the cluster, e.g.:
+#   BH_GPU=1 BH_BIN=1 BH_DELTA_BETA=500 BH_NITER=200 python run_bh.py
+USE_GPU = bool(int(os.environ.get("BH_GPU", "0")))      # True on the cluster (CuPy)
+BIN = int(os.environ.get("BH_BIN", "2"))                # 1 = full res (GPU), 4 = quick CPU test
+NITER = int(os.environ.get("BH_NITER", "100"))
+DELTA_BETA = float(os.environ.get("BH_DELTA_BETA", "300.0"))
+# Paganin delta/beta for object init: MUST match your sample (soft/biological
+# tissue at 33 keV ~ few hundred to ~1000; too small -> hollow object, as
+# Nikitin's demo value 24 was). Use the value from your existing pipeline.
 RHO = (1.0, 2.0)       # object/probe preconditioning scales (Appendix II)
 
 if USE_GPU:
