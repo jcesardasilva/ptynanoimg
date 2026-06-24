@@ -17,14 +17,24 @@ Cluster note: develop on the laptop, then on the cluster just
 and paste the printed errors / saved PNGs back.
 """
 import os
-import sys
 import time
 import h5py
 import numpy as np
+import importlib.util
 
-# --- import the BH engine from the repo (works like ptycho_recons.py does) ---
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ptypy.custom.bh_ptycho import BHPtycho
+# --- load the BH engine DIRECTLY from its file, NOT via the ptypy package ---
+# bh_ptycho.py is pure NumPy. Importing it through `import ptypy...` would run
+# ptypy's __init__, which imports mpi4py, whose MPI_Init() can BLOCK on an
+# salloc'd node without srun/mpirun (waiting on Slurm PMI) -- that was the
+# "stuck with no output, Ctrl+C dead" symptom. Loading the file directly avoids
+# pulling in ptypy/mpi4py entirely.
+_BH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                   "ptypy", "custom", "bh_ptycho.py")
+_spec = importlib.util.spec_from_file_location("bh_ptycho", _BH)
+_bh = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_bh)
+BHPtycho = _bh.BHPtycho
+_good_fft_size = _bh._good_fft_size
 
 # ----------------------------- settings ----------------------------------- #
 DATA = "Ecat_2nd_time_NFP_070nm_subtomo001_0000.h5"
@@ -97,7 +107,6 @@ def main():
     pos -= pos.mean(0)  # center the position cloud
 
     # Object size must hold the (rounded) patch plus the position spread.
-    from ptypy.custom.bh_ptycho import _good_fft_size
     npatch_est = _good_fft_size(nq + 2 * ex, parity=nq % 2)
     maxshift = int(np.ceil(np.abs(pos).max()))
     npsi = max(n + n // 4, npatch_est + 2 * maxshift + 16)
